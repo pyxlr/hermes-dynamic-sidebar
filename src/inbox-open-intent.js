@@ -8,11 +8,13 @@ async function readCodexInboxOpenedSession(thread, { stillCurrent = () => true, 
   let resolvedId = id, lineage = null
   if (followLineage || expectedRootId && expectedRootId !== id) {
     const rootId = expectedRootId || id
-    lineage = await bridge.api({
-      connectionId: scope.connectionId, profile: scope.profile,
-      path: `/api/sessions/${encodeURIComponent(rootId)}/latest-descendant?${new URLSearchParams({ profile: scope.profile })}`,
-      timeoutMs: 60_000
-    })
+    try {
+      lineage = await bridge.api({
+        connectionId: scope.connectionId, profile: scope.profile,
+        path: `/api/sessions/${encodeURIComponent(rootId)}/latest-descendant?${new URLSearchParams({ profile: scope.profile })}`,
+        timeoutMs: 60_000
+      })
+    } catch (error) { throw codexInboxRecordLoadStage(error, 'Retained thread lineage') }
     if (!stillCurrent()) throw new Error('Inbox open owner changed.')
     if (lineage?.requested_session_id !== rootId || !Array.isArray(lineage.path) || lineage.path[0] !== rootId || lineage.path.at(-1) !== lineage.session_id || lineage.path.some(value => typeof value !== 'string' || !value)) {
       throw new Error('Inbox opened-chat lineage could not be verified.')
@@ -20,11 +22,14 @@ async function readCodexInboxOpenedSession(thread, { stillCurrent = () => true, 
     if (expectedRootId && !lineage.path.includes(id)) throw Object.assign(new Error('Inbox opened-chat target does not belong to the clicked row.'), { code: 'OPEN_TARGET_NOT_FOCUSED' })
     if (followLineage) resolvedId = lineage.session_id
   }
-  const row = await bridge.api({
-    connectionId: scope.connectionId, profile: scope.profile,
-    path: `/api/sessions/${encodeURIComponent(resolvedId)}?${new URLSearchParams({ profile: scope.profile })}`,
-    timeoutMs: 60_000
-  })
+  let row
+  try {
+    row = await bridge.api({
+      connectionId: scope.connectionId, profile: scope.profile,
+      path: `/api/sessions/${encodeURIComponent(resolvedId)}?${new URLSearchParams({ profile: scope.profile })}`,
+      timeoutMs: 60_000
+    })
+  } catch (error) { throw codexInboxRecordLoadStage(error, 'Retained thread metadata') }
   if (!stillCurrent()) throw new Error('Inbox open owner changed.')
   if (!row || row.id !== resolvedId || typeof row.profile !== 'string') throw new Error('Inbox received incomplete opened-chat metadata.')
   let targetProfile = scope.profile
@@ -41,11 +46,22 @@ async function readCodexInboxOpenedSession(thread, { stillCurrent = () => true, 
 
 function isCodexInboxSessionNotFound(error) {
   const status = error?.status ?? error?.statusCode
-  if (status != null) return status === 404
-  // Electron invoke drops statusCode. Read only the native HTTP prefix,
-  // never a status mentioned inside an auth, transport or corrupt-body error.
-  const nativeStatus = /^Error invoking remote method 'hermes:api': Error: (\d{3}): /.exec(error?.message || '')
-  return nativeStatus?.[1] === '404'
+  if (status != null && status !== 404) return false
+  // Older invoke failures include the IPC prefix. Newer preload failures can
+  // carry only the HTTP message. Require the backend's exact absence payload
+  // for the latter so a missing route cannot masquerade as a missing thread.
+  const message = typeof error?.message === 'string' ? error.message : ''
+  const nativeStatus = /^(?:Error invoking remote method 'hermes:api': Error: )?(\d{3}): /.exec(message)
+  if (!nativeStatus) return status === 404
+  if (nativeStatus[1] !== '404') return false
+  try {
+    const body = JSON.parse(message.slice(nativeStatus[0].length))
+    return body && typeof body === 'object' && !Array.isArray(body) && Object.keys(body).length === 1 && body.detail === 'Session not found'
+  } catch {
+    // Retain the older non-JSON transport contract, but never accept a plain
+    // unstructured preload message as proof of an absent session.
+    return status === 404 || message.startsWith("Error invoking remote method 'hermes:api': Error: 404: ")
+  }
 }
 
 async function codexInboxUnchangedOpenOwner(sessionId, scope, stillCurrent) {

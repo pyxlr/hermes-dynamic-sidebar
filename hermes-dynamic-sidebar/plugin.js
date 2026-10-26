@@ -168,6 +168,38 @@ var CodexInboxObserverVendor=(()=>{var I=Object.defineProperty;var st=Object.get
 const INBOX_MODE_KEY = 'inbox'
 const INBOX_MODE_EVENT = `${ID}:inbox-mode`
 const INBOX_ROWS_EVENT = `${ID}:inbox-rows`
+const inboxLoadErrorStages = new WeakMap()
+
+function codexInboxRecordLoadStage(error, stage) {
+  if (error && (typeof error === 'object' || typeof error === 'function')) inboxLoadErrorStages.set(error, stage)
+  return error
+}
+
+function codexInboxLoadErrorDetail(error) {
+  // Render fixed diagnostics, never raw server bodies, URLs or session text.
+  if (error?.code === 'INBOX_SESSION_ENVELOPE') return 'INBOX_SCHEMA: Session API returned data[] instead of sessions[] and total.'
+  const message = typeof error?.message === 'string' ? error.message : ''
+  const nativePrefix = /^(?:Error invoking remote method 'hermes:api': Error: )?(\d{3}): /.exec(message)
+  const status = Number.isInteger(error?.statusCode) ? error.statusCode
+    : Number.isInteger(error?.status) ? error.status : nativePrefix ? Number(nativePrefix[1]) : null
+  if (status === 401 || status === 403) return `INBOX_HTTP_${status}: Session API denied access.`
+  if (status === 404) {
+    const stage = inboxLoadErrorStages.get(error)
+    return 'INBOX_HTTP_404: Session API route or requested resource was not found.' + (stage ? ` [${stage}]` : '')
+  }
+  if (status >= 500 && status <= 599) return `INBOX_HTTP_${status}: Session API server error.`
+  if (['ETIMEDOUT', 'ESOCKETTIMEDOUT'].includes(error?.code) || /^(?:Error invoking remote method 'hermes:api': Error: )?(?:Request timed out|Timeout|Timed out)\b/i.test(message)) {
+    return 'INBOX_TIMEOUT: Session API request timed out.'
+  }
+  if (['ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH'].includes(error?.code)) {
+    return 'INBOX_TRANSPORT: Session API connection failed.'
+  }
+  if (message === 'Inbox received an incomplete session list.') return 'INBOX_SCHEMA: Session API response is missing sessions[] or a valid total.'
+  if (message === 'The session list could not be read completely.') return 'INBOX_STORAGE: Session API reported an incomplete or corrupt store.'
+  if (message === 'Inbox scope changed.') return 'INBOX_SCOPE: Connection or profile changed during the read.'
+  if (message === 'Inbox requires the Desktop session API.') return 'INBOX_BRIDGE: Desktop session API is unavailable.'
+  return 'INBOX_UNKNOWN: Session metadata request failed. Check the Desktop log.'
+}
 
 function readCodexInboxMode() {
   try { return pluginStorage?.get(INBOX_MODE_KEY, 'on') === 'off' ? 'off' : 'on' }
@@ -405,14 +437,19 @@ async function readCodexInboxPage(scope, pageCount, signal, inbox, liveOwners = 
       limit: '100', offset: String(offset), min_messages: '1',
       archived: 'exclude', order: 'recent', profile: scope.profile
     })
-    const data = await bridge.api({
-      ...(scope.connectionId ? { connectionId: scope.connectionId } : {}),
-      profile: scope.profile,
-      path: `/api/sessions?${params}`, timeoutMs: 60_000
-    })
+    let data
+    try {
+      data = await bridge.api({
+        ...(scope.connectionId ? { connectionId: scope.connectionId } : {}),
+        profile: scope.profile,
+        path: `/api/sessions?${params}`, timeoutMs: 60_000
+      })
+    } catch (error) { throw codexInboxRecordLoadStage(error, 'Session list') }
     if (signal?.aborted || !sameInboxScope(scope, inboxOwnerScope())) throw new Error('Inbox scope changed.')
     if (!Array.isArray(data?.sessions) || !Number.isFinite(data.total) || data.total < 0) {
-      throw new Error('Inbox received an incomplete session list.')
+      const error = new Error('Inbox received an incomplete session list.')
+      if (!Array.isArray(data?.sessions) && Array.isArray(data?.data)) error.code = 'INBOX_SESSION_ENVELOPE'
+      throw error
     }
     if (targetProfile === scope.profile && data.sessions.some(session => session.profile && session.profile !== scope.profile) && host.profileRoutes) {
       const routes = await host.profileRoutes()
@@ -689,6 +726,7 @@ function startCodexInboxObserver(ctx, inbox) {
       explicitRequestedIds: data?.explicitRequestedIds,
       loading: !data && (query.isPending || query.isFetching),
       error: query.error ? 'Could not refresh Inbox.' : null,
+      errorDetail: query.error ? codexInboxLoadErrorDetail(query.error) : null,
       hasMore: !!data?.hasMore,
       loadMore: () => {
         if (disposed || mode !== 'on' || !sameInboxScope(owner, scope)) return
@@ -1038,11 +1076,13 @@ async function readCodexInboxOpenedSession(thread, { stillCurrent = () => true, 
   let resolvedId = id, lineage = null
   if (followLineage || expectedRootId && expectedRootId !== id) {
     const rootId = expectedRootId || id
-    lineage = await bridge.api({
-      connectionId: scope.connectionId, profile: scope.profile,
-      path: `/api/sessions/${encodeURIComponent(rootId)}/latest-descendant?${new URLSearchParams({ profile: scope.profile })}`,
-      timeoutMs: 60_000
-    })
+    try {
+      lineage = await bridge.api({
+        connectionId: scope.connectionId, profile: scope.profile,
+        path: `/api/sessions/${encodeURIComponent(rootId)}/latest-descendant?${new URLSearchParams({ profile: scope.profile })}`,
+        timeoutMs: 60_000
+      })
+    } catch (error) { throw codexInboxRecordLoadStage(error, 'Retained thread lineage') }
     if (!stillCurrent()) throw new Error('Inbox open owner changed.')
     if (lineage?.requested_session_id !== rootId || !Array.isArray(lineage.path) || lineage.path[0] !== rootId || lineage.path.at(-1) !== lineage.session_id || lineage.path.some(value => typeof value !== 'string' || !value)) {
       throw new Error('Inbox opened-chat lineage could not be verified.')
@@ -1050,11 +1090,14 @@ async function readCodexInboxOpenedSession(thread, { stillCurrent = () => true, 
     if (expectedRootId && !lineage.path.includes(id)) throw Object.assign(new Error('Inbox opened-chat target does not belong to the clicked row.'), { code: 'OPEN_TARGET_NOT_FOCUSED' })
     if (followLineage) resolvedId = lineage.session_id
   }
-  const row = await bridge.api({
-    connectionId: scope.connectionId, profile: scope.profile,
-    path: `/api/sessions/${encodeURIComponent(resolvedId)}?${new URLSearchParams({ profile: scope.profile })}`,
-    timeoutMs: 60_000
-  })
+  let row
+  try {
+    row = await bridge.api({
+      connectionId: scope.connectionId, profile: scope.profile,
+      path: `/api/sessions/${encodeURIComponent(resolvedId)}?${new URLSearchParams({ profile: scope.profile })}`,
+      timeoutMs: 60_000
+    })
+  } catch (error) { throw codexInboxRecordLoadStage(error, 'Retained thread metadata') }
   if (!stillCurrent()) throw new Error('Inbox open owner changed.')
   if (!row || row.id !== resolvedId || typeof row.profile !== 'string') throw new Error('Inbox received incomplete opened-chat metadata.')
   let targetProfile = scope.profile
@@ -1071,11 +1114,22 @@ async function readCodexInboxOpenedSession(thread, { stillCurrent = () => true, 
 
 function isCodexInboxSessionNotFound(error) {
   const status = error?.status ?? error?.statusCode
-  if (status != null) return status === 404
-  // Electron invoke drops statusCode. Read only the native HTTP prefix,
-  // never a status mentioned inside an auth, transport or corrupt-body error.
-  const nativeStatus = /^Error invoking remote method 'hermes:api': Error: (\d{3}): /.exec(error?.message || '')
-  return nativeStatus?.[1] === '404'
+  if (status != null && status !== 404) return false
+  // Older invoke failures include the IPC prefix. Newer preload failures can
+  // carry only the HTTP message. Require the backend's exact absence payload
+  // for the latter so a missing route cannot masquerade as a missing thread.
+  const message = typeof error?.message === 'string' ? error.message : ''
+  const nativeStatus = /^(?:Error invoking remote method 'hermes:api': Error: )?(\d{3}): /.exec(message)
+  if (!nativeStatus) return status === 404
+  if (nativeStatus[1] !== '404') return false
+  try {
+    const body = JSON.parse(message.slice(nativeStatus[0].length))
+    return body && typeof body === 'object' && !Array.isArray(body) && Object.keys(body).length === 1 && body.detail === 'Session not found'
+  } catch {
+    // Retain the older non-JSON transport contract, but never accept a plain
+    // unstructured preload message as proof of an absent session.
+    return status === 404 || message.startsWith("Error invoking remote method 'hermes:api': Error: 404: ")
+  }
 }
 
 async function codexInboxUnchangedOpenOwner(sessionId, scope, stillCurrent) {
@@ -2260,6 +2314,7 @@ html[data-dynamic-sidebar='true'] [data-dynamic-inbox-owned='badge']:focus-withi
 html[data-dynamic-sidebar='true'] [data-dynamic-inbox-owned='badge']:hover .dynamic-inbox-unsettle,
 html[data-dynamic-sidebar='true'] [data-dynamic-inbox-owned='badge']:focus-within .dynamic-inbox-unsettle { display:inline; }
 html[data-dynamic-sidebar='true'] [data-dynamic-inbox-status] { padding:6px 8px; font-size:11px; color:var(--ui-text-tertiary); }
+html[data-dynamic-sidebar='true'] [data-dynamic-inbox-error-detail] { padding:0 8px 6px; font-size:11px; line-height:1.4; color:var(--ui-text-tertiary); overflow-wrap:anywhere; }
 html[data-dynamic-sidebar='true'] [data-dynamic-inbox-settle-notice] { position:relative; overflow:hidden; display:flex; align-items:center; justify-content:space-between; gap:8px; margin:2px 4px; padding:4px 8px; border:1px solid var(--ui-stroke-secondary); border-radius:6px; background:var(--ui-sidebar-surface-background,var(--ui-bg-sidebar,var(--ui-bg-elevated))); color:var(--ui-text-primary); font:11px var(--font-sans, system-ui); }
 html[data-dynamic-sidebar='true'] [data-dynamic-inbox-settle-notice] button { padding:2px 4px; border-radius:4px; font:inherit; }
 html[data-dynamic-sidebar='true'] [data-dynamic-inbox-undo-track] { pointer-events:none; position:absolute; left:0; right:0; bottom:0; height:2px; background:color-mix(in srgb,var(--ui-accent,var(--ui-text-primary)) 12%,transparent); }
@@ -2370,7 +2425,7 @@ html[data-dynamic-sidebar='true'] [data-dynamic-inbox-undo-progress] { display:b
     }
     const sessions = inboxSessions().filter(s => !model.isSettled(currentScope, s) && !model.isSnoozed(currentScope, s));
     const shown = sessions;
-    const nextSignature = JSON.stringify([currentScope, inboxOpen, input.loading, !!input.error, model.error, admission.error, headerTemplate.fingerprint,
+    const nextSignature = JSON.stringify([currentScope, inboxOpen, input.loading, !!input.error, input.errorDetail, model.error, admission.error, headerTemplate.fingerprint,
       [...settleNotices.values()].map(item => [item.key, item.until]), sessions.length, shown.map(s => [model.key(currentScope, s), codexInboxId(s), s.title, safety(s), workState(s), active(s), activityByKey.get(model.key(currentScope, s))?.children.size || 0])]);
     if (signature !== nextSignature) {
       signature = nextSignature;
@@ -2409,6 +2464,13 @@ html[data-dynamic-sidebar='true'] [data-dynamic-inbox-undo-progress] { display:b
       const status = text => { const el = doc.createElement('div'); el.setAttribute('data-dynamic-inbox-status', ''); el.setAttribute('role', 'status'); el.textContent = text; content.appendChild(el); };
       if (input.error) {
         status('Inbox could not be loaded. Refresh Sessions to retry.');
+        if (typeof input.errorDetail === 'string') {
+          const detail = doc.createElement('div');
+          detail.setAttribute('data-dynamic-inbox-error-detail', '');
+          detail.setAttribute('role', 'status');
+          detail.textContent = input.errorDetail;
+          content.appendChild(detail);
+        }
         if (typeof input.retry === 'function') content.appendChild(button('Retry Inbox', () => input.retry()));
       }
 

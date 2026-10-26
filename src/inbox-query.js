@@ -3,6 +3,38 @@
 const INBOX_MODE_KEY = 'inbox'
 const INBOX_MODE_EVENT = `${ID}:inbox-mode`
 const INBOX_ROWS_EVENT = `${ID}:inbox-rows`
+const inboxLoadErrorStages = new WeakMap()
+
+function codexInboxRecordLoadStage(error, stage) {
+  if (error && (typeof error === 'object' || typeof error === 'function')) inboxLoadErrorStages.set(error, stage)
+  return error
+}
+
+function codexInboxLoadErrorDetail(error) {
+  // Render fixed diagnostics, never raw server bodies, URLs or session text.
+  if (error?.code === 'INBOX_SESSION_ENVELOPE') return 'INBOX_SCHEMA: Session API returned data[] instead of sessions[] and total.'
+  const message = typeof error?.message === 'string' ? error.message : ''
+  const nativePrefix = /^(?:Error invoking remote method 'hermes:api': Error: )?(\d{3}): /.exec(message)
+  const status = Number.isInteger(error?.statusCode) ? error.statusCode
+    : Number.isInteger(error?.status) ? error.status : nativePrefix ? Number(nativePrefix[1]) : null
+  if (status === 401 || status === 403) return `INBOX_HTTP_${status}: Session API denied access.`
+  if (status === 404) {
+    const stage = inboxLoadErrorStages.get(error)
+    return 'INBOX_HTTP_404: Session API route or requested resource was not found.' + (stage ? ` [${stage}]` : '')
+  }
+  if (status >= 500 && status <= 599) return `INBOX_HTTP_${status}: Session API server error.`
+  if (['ETIMEDOUT', 'ESOCKETTIMEDOUT'].includes(error?.code) || /^(?:Error invoking remote method 'hermes:api': Error: )?(?:Request timed out|Timeout|Timed out)\b/i.test(message)) {
+    return 'INBOX_TIMEOUT: Session API request timed out.'
+  }
+  if (['ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH'].includes(error?.code)) {
+    return 'INBOX_TRANSPORT: Session API connection failed.'
+  }
+  if (message === 'Inbox received an incomplete session list.') return 'INBOX_SCHEMA: Session API response is missing sessions[] or a valid total.'
+  if (message === 'The session list could not be read completely.') return 'INBOX_STORAGE: Session API reported an incomplete or corrupt store.'
+  if (message === 'Inbox scope changed.') return 'INBOX_SCOPE: Connection or profile changed during the read.'
+  if (message === 'Inbox requires the Desktop session API.') return 'INBOX_BRIDGE: Desktop session API is unavailable.'
+  return 'INBOX_UNKNOWN: Session metadata request failed. Check the Desktop log.'
+}
 
 function readCodexInboxMode() {
   try { return pluginStorage?.get(INBOX_MODE_KEY, 'on') === 'off' ? 'off' : 'on' }
@@ -240,14 +272,19 @@ async function readCodexInboxPage(scope, pageCount, signal, inbox, liveOwners = 
       limit: '100', offset: String(offset), min_messages: '1',
       archived: 'exclude', order: 'recent', profile: scope.profile
     })
-    const data = await bridge.api({
-      ...(scope.connectionId ? { connectionId: scope.connectionId } : {}),
-      profile: scope.profile,
-      path: `/api/sessions?${params}`, timeoutMs: 60_000
-    })
+    let data
+    try {
+      data = await bridge.api({
+        ...(scope.connectionId ? { connectionId: scope.connectionId } : {}),
+        profile: scope.profile,
+        path: `/api/sessions?${params}`, timeoutMs: 60_000
+      })
+    } catch (error) { throw codexInboxRecordLoadStage(error, 'Session list') }
     if (signal?.aborted || !sameInboxScope(scope, inboxOwnerScope())) throw new Error('Inbox scope changed.')
     if (!Array.isArray(data?.sessions) || !Number.isFinite(data.total) || data.total < 0) {
-      throw new Error('Inbox received an incomplete session list.')
+      const error = new Error('Inbox received an incomplete session list.')
+      if (!Array.isArray(data?.sessions) && Array.isArray(data?.data)) error.code = 'INBOX_SESSION_ENVELOPE'
+      throw error
     }
     if (targetProfile === scope.profile && data.sessions.some(session => session.profile && session.profile !== scope.profile) && host.profileRoutes) {
       const routes = await host.profileRoutes()
@@ -524,6 +561,7 @@ function startCodexInboxObserver(ctx, inbox) {
       explicitRequestedIds: data?.explicitRequestedIds,
       loading: !data && (query.isPending || query.isFetching),
       error: query.error ? 'Could not refresh Inbox.' : null,
+      errorDetail: query.error ? codexInboxLoadErrorDetail(query.error) : null,
       hasMore: !!data?.hasMore,
       loadMore: () => {
         if (disposed || mode !== 'on' || !sameInboxScope(owner, scope)) return

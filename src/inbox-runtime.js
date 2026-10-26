@@ -863,6 +863,7 @@ html[data-dynamic-sidebar='true'] [data-dynamic-inbox-owned='badge']:focus-withi
 html[data-dynamic-sidebar='true'] [data-dynamic-inbox-owned='badge']:hover .dynamic-inbox-unsettle,
 html[data-dynamic-sidebar='true'] [data-dynamic-inbox-owned='badge']:focus-within .dynamic-inbox-unsettle { display:inline; }
 html[data-dynamic-sidebar='true'] [data-dynamic-inbox-status] { padding:6px 8px; font-size:11px; color:var(--ui-text-tertiary); }
+html[data-dynamic-sidebar='true'] [data-dynamic-inbox-error-detail] { padding:0 8px 6px; font-size:11px; line-height:1.4; color:var(--ui-text-tertiary); overflow-wrap:anywhere; }
 html[data-dynamic-sidebar='true'] [data-dynamic-inbox-settle-notice] { position:relative; overflow:hidden; display:flex; align-items:center; justify-content:space-between; gap:8px; margin:2px 4px; padding:4px 8px; border:1px solid var(--ui-stroke-secondary); border-radius:6px; background:var(--ui-sidebar-surface-background,var(--ui-bg-sidebar,var(--ui-bg-elevated))); color:var(--ui-text-primary); font:11px var(--font-sans, system-ui); }
 html[data-dynamic-sidebar='true'] [data-dynamic-inbox-settle-notice] button { padding:2px 4px; border-radius:4px; font:inherit; }
 html[data-dynamic-sidebar='true'] [data-dynamic-inbox-undo-track] { pointer-events:none; position:absolute; left:0; right:0; bottom:0; height:2px; background:color-mix(in srgb,var(--ui-accent,var(--ui-text-primary)) 12%,transparent); }
@@ -973,7 +974,7 @@ html[data-dynamic-sidebar='true'] [data-dynamic-inbox-undo-progress] { display:b
     }
     const sessions = inboxSessions().filter(s => !model.isSettled(currentScope, s) && !model.isSnoozed(currentScope, s));
     const shown = sessions;
-    const nextSignature = JSON.stringify([currentScope, inboxOpen, input.loading, !!input.error, model.error, admission.error, headerTemplate.fingerprint,
+    const nextSignature = JSON.stringify([currentScope, inboxOpen, input.loading, !!input.error, input.errorDetail, model.error, admission.error, headerTemplate.fingerprint,
       [...settleNotices.values()].map(item => [item.key, item.until]), sessions.length, shown.map(s => [model.key(currentScope, s), codexInboxId(s), s.title, safety(s), workState(s), active(s), activityByKey.get(model.key(currentScope, s))?.children.size || 0])]);
     if (signature !== nextSignature) {
       signature = nextSignature;
@@ -1012,6 +1013,13 @@ html[data-dynamic-sidebar='true'] [data-dynamic-inbox-undo-progress] { display:b
       const status = text => { const el = doc.createElement('div'); el.setAttribute('data-dynamic-inbox-status', ''); el.setAttribute('role', 'status'); el.textContent = text; content.appendChild(el); };
       if (input.error) {
         status('Inbox could not be loaded. Refresh Sessions to retry.');
+        if (typeof input.errorDetail === 'string') {
+          const detail = doc.createElement('div');
+          detail.setAttribute('data-dynamic-inbox-error-detail', '');
+          detail.setAttribute('role', 'status');
+          detail.textContent = input.errorDetail;
+          content.appendChild(detail);
+        }
         if (typeof input.retry === 'function') content.appendChild(button('Retry Inbox', () => input.retry()));
       }
 

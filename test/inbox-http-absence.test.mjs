@@ -12,11 +12,14 @@ const root = process.env.CODEX_INBOX_QUERY_CORE_ROOT
 const native = root ? await (async () => {
   const require = createRequire(pathToFileURL(resolve(root, 'package.json')))
   const ts = require('typescript')
-  const source = await readFile(resolve(root, 'apps/desktop/electron/api-transport.ts'), 'utf8')
-  const { outputText } = ts.transpileModule(source, {
-    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
-  })
-  return import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`)
+  const modules = await Promise.all(['api-transport.ts', 'api-expected-404.ts'].map(async file => {
+    const source = await readFile(resolve(root, 'apps/desktop/electron', file), 'utf8')
+    const { outputText } = ts.transpileModule(source, {
+      compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext }
+    })
+    return import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`)
+  }))
+  return Object.assign({}, ...modules)
 })() : null
 const options = { skip: native ? false : 'Set CODEX_INBOX_QUERY_CORE_ROOT to a native Hermes source/package root' }
 const scope = { connectionId: 'source-A', profile: 'default' }
@@ -24,6 +27,38 @@ const foreign = { connectionId: 'source-A', profile: 'other' }
 const atom = value => ({ get: () => value, subscribe: () => () => {} })
 const serialize = error => new Error(`Error invoking remote method 'hermes:api': Error: ${error.message}`)
 const results = []
+
+test('preload-style session absence preserves retained survivors and exact owner proof', async () => {
+  const error = new Error('404: {"detail":"Session not found"}')
+  const owner = await fixture({ error })
+  assert.equal(await owner.owner(), true)
+  for (const failAt of ['lineage', 'metadata']) {
+    const retained = await fixture({ error, failAt })
+    const result = await retained.retention()
+    assert.deepEqual(Array.from(result.sessions, row => row.id), ['survivor'])
+    assert.ok(retained.calls.every(call => call.profile === scope.profile && call.connectionId === scope.connectionId))
+  }
+})
+
+test('preload-style route and malformed errors cannot prove a missing session', async () => {
+  const errors = [
+    new Error('404: {"detail":"Not Found"}'),
+    new Error('404: {"detail":"Session not found","error":"private body"}'),
+    new Error('404: ["Session not found"]'),
+    new Error('404: invalid JSON'),
+    new Error('403: {"detail":"Session not found"}'),
+    Object.assign(new Error('404: {"detail":"Session not found"}'), { status: 403 }),
+    Object.assign(new Error('404: {"detail":"Session not found"}'), { statusCode: '404' })
+  ]
+  for (const error of errors) {
+    const owner = await fixture({ error })
+    await assert.rejects(owner.owner(), actual => actual === error)
+    for (const failAt of ['lineage', 'metadata']) {
+      const retained = await fixture({ error, failAt })
+      await assert.rejects(retained.retention(), actual => actual === error)
+    }
+  }
+})
 
 async function fixture({ error, failAt = 'lineage', foreignRow, roster, stillCurrent = () => true } = {}) {
   const calls = []
@@ -73,6 +108,14 @@ async function outcome(fn, error, positive, path, label) {
 
 test('native HTTP absence matrix agrees for unchanged-open ownership and both retention stages', options, async () => {
   const scenarios = []
+  for (const [detail, positive] of [['Session not found', true], ['Not Found', false]]) {
+    const transportError = native.httpStatusError(404, JSON.stringify({ detail }))
+    let error
+    try { native.unwrapExpectedNotFound({ [native.HERMES_API_EXPECTED_404]: transportError.message }) }
+    catch (actual) { error = actual }
+    assert.ok(error instanceof Error)
+    scenarios.push({ label: `native-preload-${detail}`, error, positive })
+  }
   for (const status of [404, 401, 403, 500]) {
     const error = native.httpStatusError(status, status === 404 ? '{"detail":"Session not found"}' : '{"detail":"upstream HTTP 404 or status 404"}')
     scenarios.push({ label: `native-${status}-structured`, error, positive: status === 404 },
