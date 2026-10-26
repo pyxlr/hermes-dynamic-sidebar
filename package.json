@@ -1,0 +1,15 @@
+{
+  "name": "hermes-dynamic-sidebar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test --test-concurrency=1 test/*.test.mjs",
+    "check": "npm run build && node --check hermes-dynamic-sidebar/plugin.js"
+  },
+  "devDependencies": {
+    "@tanstack/query-core": "5.101.2"
+  }
+}

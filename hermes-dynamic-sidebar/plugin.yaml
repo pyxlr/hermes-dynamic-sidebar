@@ -1,0 +1,11 @@
+name: hermes-dynamic-sidebar
+version: "0.1.0"
+description: >-
+  Theme-independent Inbox and adaptive Pinned/Sessions layout for Hermes Desktop.
+  Includes Settle, Snooze, work indicators and persistent command-palette controls.
+author: subhead
+kind: standalone
+provides_tools: []
+provides_hooks: []
+provides_middleware: []
+requires_env: []
